@@ -1,0 +1,711 @@
+// ══════════════════════════════════════════════════════════════
+//  TELLO AUTOMATIC BUTTON MAX TWO — COMPETITION TIMING V2
+//
+//  Changes from MAX:
+//    - Return distance: 35cm (was 30cm) — gets closer to pad
+//    - 5s hover wait after coming back before pad lock
+//
+//  TIMELINE (from power-on):
+//    T=0s:     Both boards power on, ESP32 connects WiFi + SDK
+//    T=0-17s:  17s initial delay (robot waiting)
+//    T=17-22s: Robot moves for 5s (drone sitting on top)
+//    T=22-37s: Robot stops for 15s
+//    T=30s:    *** DRONE TAKES OFF *** (middle of 15s stop)
+//    T=37-57s: Robot pressing red button (20s) — drone flying
+//    T=57s+:   Robot is back, waiting for drone to land
+//
+//  DRONE FLIGHT:
+//    Takeoff + 5s stabilize
+//    → fwd 40 + 2s → CW 180 + 2s
+//    → fwd 35 + 2s → CW 180 + 2s
+//    → 5s hover (stabilize before pad lock)
+//    → find pad → center → descend → RC fine → land
+//
+//  Emergency: E or L via serial if connected
+// ══════════════════════════════════════════════════════════════
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+// ══════════════════════════════════════════════════════════════
+//                    EASY TO CHANGE VARIABLES
+// ══════════════════════════════════════════════════════════════
+
+// ─────────────── WIFI ───────────────
+const char* WIFI_NAME = "TELLO-OLLET";
+const char* WIFI_PASSWORD = "southeast2026";
+
+// ─────────────── TIMING ───────────────
+// 17s delay + 5s robot moves + 8s into the 15s stop = 30s
+unsigned long TAKEOFF_TIME = 30000;   // T=30s: takeoff (middle of robot's 15s stop)
+
+// ─────────────── FLIGHT PATH ───────────────
+int MOVE_AWAY_DISTANCE = 40;    // cm forward (away from robot)
+int TURN_DEGREES = 180;         // CW turn
+int RETURN_DISTANCE = 40;       // cm forward after turn (back toward pad) — was 30
+
+// ─────────────── PRE-LOCK HOVER ───────────────
+int HOVER_BEFORE_LOCK = 5000;   // 5s hover to stabilize before looking for pad
+
+// ─────────────── GO COMMAND (gradual descent) ───────────────
+int GO_HEIGHTS[] = {60, 50, 40, 30, 25};
+int NUM_GO_STEPS = 5;
+int GO_SPEED = 15;
+int GO_X_OFFSET = 0;
+int GO_Y_OFFSET = 0;
+
+// ─────────────── RC FINE-TUNING ───────────────
+int FINE_SPEED = 10;
+int FINE_ZONE = 8;
+int FINE_COUNT = 5;
+int PAD_X_OFFSET = -6;
+int PAD_Y_OFFSET = 0;
+bool INVERT_PITCH = false;
+bool INVERT_ROLL = true;
+
+// ─────────────── FALLBACK RC CENTERING ───────────────
+int NUDGE_SPEED = 15;
+int VERIFY_ZONE = 15;
+int VERIFY_COUNT = 5;
+
+// ─────────────── TIMING ───────────────
+int STABILIZE_AFTER_TAKEOFF = 5000;
+int PAUSE_AFTER_MOVE = 2000;
+int COMMAND_RETRY_DELAY = 500;
+
+// ─────────────── LANDING ───────────────
+bool USE_EMERGENCY_LAND = false;
+
+// ══════════════════════════════════════════════════════════════
+//                    NETWORK
+// ══════════════════════════════════════════════════════════════
+
+const char* TELLO_IP = "192.168.10.1";
+const int CMD_PORT = 8889;
+const int STATE_PORT = 8890;
+
+WiFiUDP udpCmd;
+WiFiUDP udpState;
+
+// ══════════════════════════════════════════════════════════════
+//                    STATE VARIABLES
+// ══════════════════════════════════════════════════════════════
+
+bool flightActive = false;
+int padId = -1;
+int padX = 0, padY = 0, padZ = 0;
+unsigned long lastStateRead = 0;
+unsigned long lastPrintTime = 0;
+int batteryLevel = 0;
+unsigned long bootTime = 0;
+
+// ══════════════════════════════════════════════════════════════
+//                    TELLO COMMUNICATION
+// ══════════════════════════════════════════════════════════════
+
+void sendCommand(const char* cmd) {
+    Serial.print(">> ");
+    Serial.println(cmd);
+    udpCmd.beginPacket(TELLO_IP, CMD_PORT);
+    udpCmd.print(cmd);
+    udpCmd.endPacket();
+}
+
+String waitResponse(int timeoutMs = 10000) {
+    unsigned long start = millis();
+    while (millis() - start < (unsigned long)timeoutMs) {
+        int size = udpCmd.parsePacket();
+        if (size) {
+            char buf[256];
+            int len = udpCmd.read(buf, 255);
+            buf[len] = 0;
+            Serial.print("<< ");
+            Serial.println(buf);
+            return String(buf);
+        }
+        delay(10);
+    }
+    Serial.println("<< TIMEOUT");
+    return "TIMEOUT";
+}
+
+bool sendWithRetry(const char* cmd, int delayAfter = 0) {
+    sendCommand(cmd);
+    String resp = waitResponse();
+    if (resp != "ok") {
+        Serial.println("   Retrying...");
+        delay(COMMAND_RETRY_DELAY);
+        sendCommand(cmd);
+        resp = waitResponse();
+    }
+    if (delayAfter > 0) delay(delayAfter);
+    return (resp == "ok");
+}
+
+// ══════════════════════════════════════════════════════════════
+//                    STATE READING
+// ══════════════════════════════════════════════════════════════
+
+bool readState() {
+    String latest = "";
+    while (udpState.parsePacket()) {
+        char buf[512];
+        int len = udpState.read(buf, 511);
+        if (len > 0) { buf[len] = 0; latest = String(buf); }
+    }
+    if (latest.length() == 0) return false;
+    lastStateRead = millis();
+
+    int idx;
+    idx = latest.indexOf("mid:");
+    if (idx != -1) padId = latest.substring(idx + 4, latest.indexOf(";", idx)).toInt();
+    idx = latest.indexOf(";x:");
+    if (idx != -1) padX = latest.substring(idx + 3, latest.indexOf(";", idx + 3)).toInt();
+    idx = latest.indexOf(";y:");
+    if (idx != -1) padY = latest.substring(idx + 3, latest.indexOf(";", idx + 3)).toInt();
+    idx = latest.indexOf(";z:");
+    if (idx != -1) padZ = latest.substring(idx + 3, latest.indexOf(";", idx + 3)).toInt();
+    idx = latest.indexOf("bat:");
+    if (idx != -1) batteryLevel = latest.substring(idx + 4, latest.indexOf(";", idx)).toInt();
+    return true;
+}
+
+// ══════════════════════════════════════════════════════════════
+//                    RC CONTROL
+// ══════════════════════════════════════════════════════════════
+
+void sendRC(int roll, int pitch, int throttle, int yaw) {
+    char cmd[50];
+    sprintf(cmd, "rc %d %d %d %d", roll, pitch, throttle, yaw);
+    sendCommand(cmd);
+}
+
+void stopMovement() {
+    sendRC(0, 0, 0, 0);
+    delay(100);
+}
+
+bool checkEmergency() {
+    if (Serial.available()) {
+        char c = toupper(Serial.read());
+        if (c == 'E') {
+            Serial.println("\n!!! EMERGENCY !!!");
+            sendCommand("emergency");
+            flightActive = false;
+            return true;
+        }
+        if (c == 'L') {
+            Serial.println("\nManual land...");
+            sendCommand("land");
+            flightActive = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ══════════════════════════════════════════════════════════════
+//                    TIMING HELPERS
+// ══════════════════════════════════════════════════════════════
+
+unsigned long elapsedSeconds() {
+    return (millis() - bootTime) / 1000;
+}
+
+bool waitUntil(unsigned long targetMs, const char* label) {
+    unsigned long now = millis() - bootTime;
+    if (now >= targetMs) {
+        Serial.printf("   %s: already past T=%lus (now T=%lus)\n",
+                      label, targetMs / 1000, now / 1000);
+        return true;
+    }
+
+    unsigned long remaining = (targetMs - now) / 1000;
+    Serial.printf("\n>>> WAITING for %s at T=%lus (%lus from now) <<<\n",
+                  label, targetMs / 1000, remaining);
+
+    unsigned long lastPrint = 0;
+    unsigned long lastKeepalive = 0;
+    while ((millis() - bootTime) < targetMs) {
+        if (checkEmergency()) return false;
+
+        unsigned long secLeft = (targetMs - (millis() - bootTime)) / 1000;
+        if (secLeft != lastPrint && secLeft > 0 && secLeft % 5 == 0) {
+            Serial.printf("   T=%lus | %s in %lus\n",
+                          elapsedSeconds(), label, secLeft);
+            lastPrint = secLeft;
+        }
+
+        // Keepalive: ping drone every 10s so UDP connection stays fresh
+        unsigned long nowMs = millis();
+        if (nowMs - lastKeepalive >= 10000) {
+            sendCommand("battery?");
+            String resp = waitResponse(3000);
+            resp.trim();
+            Serial.printf("   Keepalive — battery: %s%%\n", resp.c_str());
+            lastKeepalive = nowMs;
+        }
+
+        delay(200);
+    }
+
+    Serial.printf("   T=%lus | >>> %s NOW <<<\n", elapsedSeconds(), label);
+    return true;
+}
+
+// ══════════════════════════════════════════════════════════════
+//                    LANDING
+// ══════════════════════════════════════════════════════════════
+
+void performLand() {
+    stopMovement();
+    delay(200);
+    if (USE_EMERGENCY_LAND) {
+        Serial.println("*** EMERGENCY LAND (drop) ***");
+        sendCommand("emergency");
+    } else {
+        Serial.println("*** NORMAL LAND ***");
+        sendCommand("land");
+    }
+    waitResponse(10000);
+    flightActive = false;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  GO TO PAD CENTER
+// ══════════════════════════════════════════════════════════════
+
+bool goToCenter(int height, int speed) {
+    for (int i = 0; i < 3; i++) { readState(); delay(50); }
+
+    if (padId <= 0) {
+        Serial.println("   ERROR: No pad detected!");
+        return false;
+    }
+
+    Serial.printf("   Pad: ID=%d | Pos: X:%d Y:%d Z:%d\n", padId, padX, padY, padZ);
+    stopMovement();
+
+    char goCmd[50];
+    sprintf(goCmd, "go %d %d %d %d m%d", GO_X_OFFSET, GO_Y_OFFSET, height, speed, padId);
+
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        Serial.printf("   Sending (attempt %d): %s\n", attempt, goCmd);
+        sendCommand(goCmd);
+        String resp = waitResponse(25000);
+
+        if (resp == "ok") {
+            delay(200);
+            for (int i = 0; i < 3; i++) { readState(); delay(50); }
+            Serial.printf("   After go: X:%d Y:%d Z:%d (pad %d)\n", padX, padY, padZ, padId);
+            return true;
+        }
+
+        Serial.printf("   Attempt %d failed: %s\n", attempt, resp.c_str());
+        if (attempt < 2) {
+            Serial.println("   Re-entering SDK mode...");
+            sendWithRetry("command", 500);
+            sendWithRetry("mon", 500);
+            sendWithRetry("mdirection 0", 500);
+            delay(1000);
+            for (int i = 0; i < 5; i++) { readState(); delay(100); }
+            if (padId <= 0) { Serial.println("   Pad lost!"); return false; }
+        }
+    }
+    Serial.println("   go failed after 2 attempts!");
+    return false;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  WAIT FOR PAD
+// ══════════════════════════════════════════════════════════════
+
+bool waitForPad(int timeoutMs) {
+    Serial.printf("   Waiting for pad (%ds timeout)...\n", timeoutMs / 1000);
+    unsigned long start = millis();
+    while (millis() - start < (unsigned long)timeoutMs) {
+        if (checkEmergency()) return false;
+        readState();
+        if (padId > 0) {
+            Serial.printf("   PAD FOUND! ID=%d | X:%d Y:%d Z:%d\n", padId, padX, padY, padZ);
+            return true;
+        }
+        delay(100);
+    }
+    Serial.println("   Pad detection timeout!");
+    return false;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  RC FINE-TUNING
+// ══════════════════════════════════════════════════════════════
+
+bool fineCenterRC() {
+    Serial.printf("\n   RC fine-tuning (zone +/-%dcm, speed %d, need %d)...\n",
+                  FINE_ZONE, FINE_SPEED, FINE_COUNT);
+
+    int centeredCount = 0;
+    unsigned long startTime = millis();
+    const unsigned long TIMEOUT = 10000;
+
+    while (millis() - startTime < TIMEOUT && flightActive) {
+        if (checkEmergency()) return false;
+        readState();
+
+        if (padId <= 0) { centeredCount = 0; delay(100); continue; }
+
+        int errorX = padX - PAD_X_OFFSET;
+        int errorY = padY - PAD_Y_OFFSET;
+        bool centered = abs(errorX) <= FINE_ZONE && abs(errorY) <= FINE_ZONE;
+
+        if (centered) {
+            centeredCount++;
+            stopMovement();
+        } else {
+            centeredCount = 0;
+            int roll = 0, pitch = 0;
+            if (errorX > FINE_ZONE) pitch = -FINE_SPEED;
+            else if (errorX < -FINE_ZONE) pitch = FINE_SPEED;
+            if (errorY > FINE_ZONE) roll = -FINE_SPEED;
+            else if (errorY < -FINE_ZONE) roll = FINE_SPEED;
+            if (INVERT_PITCH) pitch = -pitch;
+            if (INVERT_ROLL) roll = -roll;
+            sendRC(roll, pitch, 0, 0);
+        }
+
+        if (millis() - lastPrintTime > 500) {
+            lastPrintTime = millis();
+            Serial.printf("   X:%d Y:%d Z:%d | err X:%d Y:%d | %s",
+                          padX, padY, padZ, errorX, errorY,
+                          centered ? "LOCKED" : "nudging");
+            if (centered) Serial.printf(" [%d/%d]", centeredCount, FINE_COUNT);
+            Serial.println();
+        }
+
+        if (centeredCount >= FINE_COUNT) {
+            Serial.printf("   FINE-TUNED! X:%d Y:%d Z:%d\n", padX, padY, padZ);
+            stopMovement();
+            return true;
+        }
+        delay(50);
+    }
+    Serial.println("   Fine-tune timeout -- landing anyway");
+    stopMovement();
+    return false;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  FALLBACK RC CENTERING
+// ══════════════════════════════════════════════════════════════
+
+bool centerOnPadRC() {
+    Serial.println("\n--- FALLBACK: RC centering ---");
+    int centeredCount = 0;
+    unsigned long startTime = millis();
+    const unsigned long TIMEOUT = 20000;
+
+    while (millis() - startTime < TIMEOUT && flightActive) {
+        if (checkEmergency()) return false;
+        readState();
+
+        if (padId <= 0) { stopMovement(); centeredCount = 0; delay(500); continue; }
+
+        int errorX = padX - PAD_X_OFFSET;
+        int errorY = padY - PAD_Y_OFFSET;
+        bool centered = abs(errorX) <= VERIFY_ZONE && abs(errorY) <= VERIFY_ZONE;
+
+        if (centered) centeredCount++; else centeredCount = 0;
+
+        if (centeredCount >= VERIFY_COUNT) {
+            Serial.println("   RC centering complete!");
+            stopMovement();
+            return true;
+        }
+
+        int roll = 0, pitch = 0;
+        if (errorX > VERIFY_ZONE) pitch = -NUDGE_SPEED;
+        else if (errorX < -VERIFY_ZONE) pitch = NUDGE_SPEED;
+        if (errorY > VERIFY_ZONE) roll = -NUDGE_SPEED;
+        else if (errorY < -VERIFY_ZONE) roll = NUDGE_SPEED;
+        if (INVERT_PITCH) pitch = -pitch;
+        if (INVERT_ROLL) roll = -roll;
+        sendRC(roll, pitch, 0, 0);
+        delay(100);
+    }
+    Serial.println("   RC centering timeout!");
+    stopMovement();
+    return false;
+}
+
+// ══════════════════════════════════════════════════════════════
+//                    SETUP
+// ══════════════════════════════════════════════════════════════
+
+void setup() {
+    bootTime = millis();
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n\n==========================================================");
+    Serial.println("   TELLO AUTOMATIC BUTTON MAX TWO — COMPETITION TIMING V2");
+    Serial.println("==========================================================\n");
+
+    Serial.println("CHANGES FROM MAX:");
+    Serial.println("  - Return distance: 35cm (was 30cm)");
+    Serial.println("  - 5s hover wait before pad lock\n");
+
+    Serial.println("COMPETITION TIMELINE:");
+    Serial.println("  T=0s:     Power on, ESP32 connects WiFi");
+    Serial.println("  T=0-17s:  17s initial delay (robot waiting)");
+    Serial.println("  T=17-22s: Robot moves for 5s (drone on top)");
+    Serial.println("  T=22-37s: Robot stops for 15s");
+    Serial.printf("  T=%lus:    *** DRONE TAKES OFF *** (middle of 15s stop)\n", TAKEOFF_TIME / 1000);
+    Serial.println("  T=37-57s: Robot pressing red button (20s) — drone flying");
+    Serial.println("  T=57s+:   Robot back, waiting for drone to land\n");
+
+    Serial.println("DRONE FLIGHT:");
+    Serial.printf("  Takeoff + %ds stabilize\n", STABILIZE_AFTER_TAKEOFF / 1000);
+    Serial.printf("  → fwd %d + %ds → CW %d + %ds\n",
+                  MOVE_AWAY_DISTANCE, PAUSE_AFTER_MOVE / 1000,
+                  TURN_DEGREES, PAUSE_AFTER_MOVE / 1000);
+    Serial.printf("  → fwd %d + %ds → CW %d + %ds\n",
+                  RETURN_DISTANCE, PAUSE_AFTER_MOVE / 1000,
+                  TURN_DEGREES, PAUSE_AFTER_MOVE / 1000);
+    Serial.printf("  → %ds hover stabilize\n", HOVER_BEFORE_LOCK / 1000);
+    Serial.println("  → find pad → center → descend → RC fine → land\n");
+
+    // ════════════════════════════════════════════════════════════
+    // PHASE 0: CONNECT TO DRONE
+    // ════════════════════════════════════════════════════════════
+
+    Serial.printf("T=%lus | Connecting to drone...\n", elapsedSeconds());
+
+    Serial.print("Connecting to Tello");
+    if (strlen(WIFI_PASSWORD) > 0) {
+        WiFi.begin(WIFI_NAME, WIFI_PASSWORD);
+    } else {
+        WiFi.begin(WIFI_NAME, "");
+    }
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\n\nWiFi FAILED!");
+        while (1) delay(1000);
+    }
+    Serial.printf(" Connected! (T=%lus)\n\n", elapsedSeconds());
+
+    // Setup UDP
+    udpCmd.begin(CMD_PORT);
+    udpState.begin(STATE_PORT);
+    delay(1000);
+
+    // Enter SDK mode + pad detection
+    Serial.printf("T=%lus | Entering SDK mode...\n", elapsedSeconds());
+    sendWithRetry("command", 500);
+    sendWithRetry("mon", 500);
+    sendWithRetry("mdirection 0", 500);
+
+    // Battery check
+    sendCommand("battery?");
+    String bat = waitResponse(3000);
+    bat.trim();
+    Serial.printf("Battery: %s%%\n", bat.c_str());
+
+    Serial.printf("\nT=%lus | DRONE READY. Waiting for takeoff at T=%lus...\n",
+                  elapsedSeconds(), TAKEOFF_TIME / 1000);
+
+    // ════════════════════════════════════════════════════════════
+    // WAIT FOR TAKEOFF TIME (T=30s — middle of robot's 15s stop)
+    // ════════════════════════════════════════════════════════════
+
+    if (!waitUntil(TAKEOFF_TIME, "TAKEOFF")) goto done;
+
+    // ════════════════════════════════════════════════════════════
+    // FLIGHT: OUT → BACK → HOVER → FIND PAD → LAND
+    // Robot is pressing button during this (T=37-57s)
+    // Robot waiting for drone after T=57s
+    // ════════════════════════════════════════════════════════════
+
+    Serial.println("\n==========================================================");
+    Serial.printf("T=%lus | FLIGHT: OUT → BACK → HOVER → FIND PAD → LAND\n", elapsedSeconds());
+    Serial.println("==========================================================\n");
+
+    flightActive = true;
+
+    {
+        char cmd[30];
+
+        // Re-enter SDK mode
+        sendWithRetry("command", 500);
+        sendWithRetry("mon", 500);
+        sendWithRetry("mdirection 0", 500);
+
+        // [1] Takeoff
+        Serial.printf("T=%lus | [1] TAKEOFF...\n", elapsedSeconds());
+        if (!sendWithRetry("takeoff", STABILIZE_AFTER_TAKEOFF)) {
+            Serial.println("    TAKEOFF FAILED!");
+            flightActive = false;
+            goto done;
+        }
+        if (checkEmergency() || !flightActive) goto done;
+
+        // [2] Forward 40 (move away from robot)
+        Serial.printf("T=%lus | [2] FORWARD %dcm (away from robot)...\n",
+                      elapsedSeconds(), MOVE_AWAY_DISTANCE);
+        sprintf(cmd, "forward %d", MOVE_AWAY_DISTANCE);
+        sendWithRetry(cmd, PAUSE_AFTER_MOVE);
+        if (checkEmergency() || !flightActive) goto done;
+
+        // [3] CW 180 (turn around)
+        Serial.printf("T=%lus | [3] CW %d (turn around)...\n",
+                      elapsedSeconds(), TURN_DEGREES);
+        sprintf(cmd, "cw %d", TURN_DEGREES);
+        sendWithRetry(cmd, PAUSE_AFTER_MOVE);
+        if (checkEmergency() || !flightActive) goto done;
+
+        // [4] Forward 35 (come back toward pad — 5cm closer than MAX)
+        Serial.printf("T=%lus | [4] FORWARD %dcm (return toward pad)...\n",
+                      elapsedSeconds(), RETURN_DISTANCE);
+        sprintf(cmd, "forward %d", RETURN_DISTANCE);
+        sendWithRetry(cmd, PAUSE_AFTER_MOVE);
+        if (checkEmergency() || !flightActive) goto done;
+
+        // [5] CW 180 (face original direction)
+        Serial.printf("T=%lus | [5] CW %d (face original direction)...\n",
+                      elapsedSeconds(), TURN_DEGREES);
+        sprintf(cmd, "cw %d", TURN_DEGREES);
+        sendWithRetry(cmd, PAUSE_AFTER_MOVE);
+        if (checkEmergency() || !flightActive) goto done;
+
+        // [6] HOVER — let drone stabilize before locking to pad
+        Serial.printf("\nT=%lus | [6] HOVERING %ds (stabilize before pad lock)...\n",
+                      elapsedSeconds(), HOVER_BEFORE_LOCK / 1000);
+        stopMovement();
+        delay(HOVER_BEFORE_LOCK);
+        if (checkEmergency() || !flightActive) goto done;
+
+        // ─── AT THIS POINT: Robot is pressing button or already back ───
+        Serial.printf("\nT=%lus | Robot should be pressing button or returning...\n",
+                      elapsedSeconds());
+
+        // [7] Look for pad
+        Serial.printf("\nT=%lus | [7] Looking for pad...\n", elapsedSeconds());
+        bool padFound = waitForPad(10000);
+
+        if (!padFound) {
+            Serial.println("   No pad found! Trying RC centering...");
+            if (!centerOnPadRC()) {
+                Serial.println("   Failed -- landing wherever.");
+                performLand();
+                goto done;
+            }
+        }
+        if (!flightActive) goto done;
+
+        // [8] CENTER AT CURRENT HEIGHT (no descent yet)
+        {
+            for (int i = 0; i < 5; i++) { readState(); delay(100); }
+            int currentZ = padZ;
+            if (currentZ < 30) currentZ = 30;
+
+            Serial.printf("\nT=%lus | [8] CENTER at current height (%dcm)...\n",
+                          elapsedSeconds(), currentZ);
+            Serial.println("   (horizontal move only — no descent yet)");
+
+            bool centerOk = goToCenter(currentZ, GO_SPEED);
+            if (checkEmergency() || !flightActive) goto done;
+
+            if (!centerOk) {
+                Serial.println("   Centering failed! Trying RC centering...");
+                if (!centerOnPadRC()) {
+                    Serial.println("   Failed -- landing wherever.");
+                    performLand();
+                    goto done;
+                }
+            }
+
+            for (int i = 0; i < 3; i++) { readState(); delay(50); }
+            Serial.printf("   After centering: X:%d Y:%d Z:%d\n", padX, padY, padZ);
+        }
+
+        if (checkEmergency() || !flightActive) goto done;
+
+        // [9] GRADUAL DESCENT
+        Serial.printf("\nT=%lus | [9] GO descent: ", elapsedSeconds());
+        for (int i = 0; i < NUM_GO_STEPS; i++) Serial.printf("%d ", GO_HEIGHTS[i]);
+        Serial.println();
+
+        for (int i = 0; i < NUM_GO_STEPS; i++) {
+            Serial.printf("\n   GO to %dcm...\n", GO_HEIGHTS[i]);
+
+            bool goOk = goToCenter(GO_HEIGHTS[i], GO_SPEED);
+            if (checkEmergency() || !flightActive) goto done;
+
+            if (!goOk && i == 0) {
+                Serial.println("   First descent step failed! Trying RC centering...");
+                if (!centerOnPadRC()) {
+                    Serial.println("   Failed -- landing wherever.");
+                    performLand();
+                    goto done;
+                }
+            } else if (!goOk) {
+                Serial.printf("   go step %d failed -- proceeding.\n", i + 1);
+            }
+
+            if (checkEmergency() || !flightActive) goto done;
+        }
+
+        // [10] RC FINE-TUNE
+        Serial.printf("\nT=%lus | [10] RC fine-tuning...\n", elapsedSeconds());
+        fineCenterRC();
+        if (checkEmergency() || !flightActive) goto done;
+
+        // Final position
+        delay(500);
+        for (int i = 0; i < 5; i++) { readState(); delay(100); }
+        Serial.printf("   Final position: X:%d Y:%d Z:%d (pad %d)\n",
+                      padX, padY, padZ, padId);
+
+        // [11] LAND
+        Serial.printf("\nT=%lus | [11] PRECISION LANDING...\n", elapsedSeconds());
+        Serial.println("   Robot should be back and waiting by now.");
+        performLand();
+    }
+
+done:
+    // Final battery check
+    sendCommand("battery?");
+    String batEnd = waitResponse(3000);
+    batEnd.trim();
+    Serial.printf("\nT=%lus | Battery: %s%%\n", elapsedSeconds(), batEnd.c_str());
+    Serial.printf("   Total time from boot: %lu seconds\n", elapsedSeconds());
+    Serial.println("\n==========================================================");
+    Serial.println("          ALL DONE!");
+    Serial.println("==========================================================\n");
+}
+
+// ══════════════════════════════════════════════════════════════
+//                    LOOP (emergency only)
+// ══════════════════════════════════════════════════════════════
+
+void loop() {
+    if (Serial.available()) {
+        char c = toupper(Serial.read());
+        if (c == 'E') {
+            Serial.println("\n!!! EMERGENCY !!!");
+            sendCommand("emergency");
+            flightActive = false;
+        } else if (c == 'L') {
+            Serial.println("\nLanding...");
+            sendCommand("land");
+            flightActive = false;
+        }
+    }
+    delay(10);
+}

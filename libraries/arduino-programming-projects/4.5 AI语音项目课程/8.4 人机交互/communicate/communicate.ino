@@ -1,0 +1,30 @@
+#include "hiwonder_robot.h"
+
+Robot minihexa;
+
+uint8_t result;
+
+void setup() {
+  Serial.begin(115200);
+  minihexa.begin();
+}
+
+void loop() {
+  result = minihexa.sensor.asr.rec_recognition();
+  switch(result) {
+    case 26:  /* 识别到你好 */
+      minihexa.action_group_run(14);
+      break;
+
+    case 27:  /* 识别到介绍自己 */
+      minihexa.acting_cute();
+      break;
+
+    case 28:  /* 识别到露一手 */
+      minihexa.action_group_run(7);
+      break;
+    
+    default:
+      break;
+  }
+}
