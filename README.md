@@ -6,7 +6,7 @@ This repository contains the drone subsystem code for the autonomous hardware co
 
 ## Demo
 
-[![Watch the competition run on YouTube](https://img.youtube.com/vi/mNvJu6kJTno/maxresdefault.jpg)](https://www.youtube.com/watch?v=mNvJu6kJTno)
+[![Watch the competition run on YouTube](https://img.youtube.com/vi/mNvJu6kJTno/hqdefault.jpg)](https://www.youtube.com/watch?v=mNvJu6kJTno)
 
 Direct link: <https://www.youtube.com/watch?v=mNvJu6kJTno>
 
