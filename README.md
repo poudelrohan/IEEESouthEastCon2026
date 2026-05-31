@@ -6,10 +6,21 @@ This repository contains the drone subsystem code for the autonomous hardware co
 
 ## Demo
 
-<!-- Add demo GIF/video here -->
-> Demo coming soon
+[![Watch the competition run on YouTube](https://img.youtube.com/vi/mNvJu6kJTno/maxresdefault.jpg)](https://www.youtube.com/watch?v=mNvJu6kJTno)
 
-![Competition Demo](https://via.placeholder.com/800x400?text=Demo+Coming+Soon)
+Direct link: <https://www.youtube.com/watch?v=mNvJu6kJTno>
+
+Autonomous run of our robot and drone on the IEEE SoutheastCon 2026 hardware competition course.
+
+## Recognition
+
+**3rd place** out of 40+ universities at the IEEE SoutheastCon 2026 Hardware Competition in Huntsville, Alabama.
+
+- [Award announcement on stage](https://www.youtube.com/watch?v=oMm68wX1SOc): our hardware team going up to receive the prize at the closing ceremony.
+
+## My role
+
+This repository is the **drone subsystem** of our hardware competition entry. The ESP32 firmware, the Tello EDU control loop, the mission pad-based precision landing, the timing coordination with the ground robot, and every code iteration in here are my work. The ground robot itself was built by other club members on Arduino Mega.
 
 ## Competition Overview
 
@@ -125,6 +136,18 @@ The Tello's camera tilts ~10° forward, causing a consistent +5cm drift in X dur
 **5. Timing Coordination**
 The drone and robot share one battery and one power switch. The ESP32 takes ~17s to boot and connect to the Tello's WiFi. The robot starts moving immediately. All drone actions are timed to absolute timestamps from power-on to stay in sync with the robot's autonomous path.
 
+## Journey
+
+I had never flown a drone before this. The first thing I did with this project was crash a couple of practice drones around my dorm and the club room, which was a lot of fun and only possible because Dr. Calderon kept handing me old hardware he knew I would break. The actual competition drone was a Tello EDU that he had been holding onto for years. DJI does not sell them anymore, so the one I was learning on could not really be replaced.
+
+On the software side, the first wall was the ESP32. I had never used one. I tried the Python Tello SDK before I started writing Arduino code, but the precision was not good enough for what we needed, and the final pipeline had to run on an Arduino anyway. So I started small: just takeoff, just land, just hold position. I owe a real debt to the [Tello Pilots Forums](https://tellopilots.com/) for keeping documentation alive for a discontinued model that DJI was not going to help me with.
+
+The hard problem was precision landing. The Tello has mission pads that the drone can recognize as visual anchors, but they are not actually designed for the drone to land on top of one. They are designed for relative positioning. The trick was using the pad as a coordinate system: the drone knew where it was relative to the pad center, so I built a step-wise descent that re-centered at each height instead of dropping straight down. It took 27 versions of the code over two months from February to competition day, improving one thing at a time.
+
+I also wrote fallbacks into every phase. If the drone could not find the pad, or the WiFi dropped, or anything else went sideways, the drone would clear out of the robot's way rather than block the rest of the run.
+
+At competition we ended up being the only team with a fully working drone, and it got a lot of appreciation from judges and other teams. The drone took maybe a third of our prep time but earned a disproportionate share of our points. The proudest moment was that across every round we ran, the drone landed perfectly every time.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -140,18 +163,21 @@ The drone and robot share one battery and one power switch. The ESP32 takes ~17s
 
 ```
 IEEESouthEastCon2026/
-├── Automatic17/              # Final production code (620+ lines)
-├── Automatic13-16/           # Progressive autonomous versions
-├── AutomaticButton*/         # Competition-day timing variants
-├── DroneSimplified10-13/     # Early iteration versions
-├── ESP32_PhaseControl/       # Serial command coordination prototype
-├── DroneMissionPadCheck/     # Mission pad detection testing
-├── Hover30s/                 # Hover stability test
-├── Shortcut, Shortcut17/    # Isolated landing tests
-└── CONTEXT_FOR_NEW_CHAT.md   # Mission timeline and coordination specs
+├── DroneCompetitonCode/         # All ESP32 / Tello flight code
+│   ├── Automatic17/             # Final competition version
+│   ├── Automatic13 to 16/       # Progressive autonomous iterations
+│   ├── AutomaticButton*/        # Competition-day timing variants
+│   ├── DroneSimplified10 to 13/ # Early iterations
+│   ├── ESP32_PhaseControl/      # Serial command coordination prototype
+│   ├── DroneMissionPadCheck/    # Mission pad detection testing
+│   ├── Hover30s/                # Hover stability test
+│   └── Shortcut, Shortcut17/    # Isolated landing tests
+├── DronePassword/               # Utility to update Tello WiFi credentials
+├── libraries/                   # Vendored Arduino libraries (TelloESP32, etc.)
+└── media/                       # Photos used in this README
 ```
 
-> **`Automatic17.ino`** is the final competition version. **`AutomaticButtonMAXTwo.ino`** is the last iteration with pre-landing hover stabilization.
+> **`DroneCompetitonCode/Automatic17/Automatic17.ino`** is the final competition version. **`AutomaticButtonMAXTwo.ino`** is the last iteration with pre-landing hover stabilization.
 
 ## Getting Started
 
@@ -178,7 +204,15 @@ IEEESouthEastCon2026/
 
 ## Team
 
-Built by the **Bethune-Cookman University IEEE Robotics Club**.
+Built by the **Bethune-Cookman University IEEE Robotics Club** hardware team, with faculty advisor **Dr. Calderon**.
+
+This repository is the drone subsystem. The ground robot was built by other club members. The BCU IEEE chapter also fielded software (game-making) and ethics teams at SoutheastCon 2026.
+
+![Hardware competition team at IEEE SoutheastCon 2026 with Dr. Calderon](./media/hardware-team.jpg)
+*Hardware team at IEEE SoutheastCon 2026 in Huntsville, Alabama, with Dr. Calderon. I am at the back, holding the Tello EDU drone.*
+
+![Full BCU IEEE chapter at SoutheastCon 2026](./media/bcu-ieee-full-team.jpg)
+*The full BCU IEEE chapter at SoutheastCon 2026, including the software (game-making) and ethics teams alongside hardware.*
 
 ## License
 
